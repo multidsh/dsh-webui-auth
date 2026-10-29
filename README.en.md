@@ -1,0 +1,242 @@
+# dsh-webui-auth
+
+English | [中文](README.md)
+
+> **About this repository**: based on the published package `dsh-webui-auth@0.3.6`
+> (MIT, © 2026 Yuuz12), plus the 0.3.7 patch described in [CHANGELOG](CHANGELOG.md).
+> Licence and copyright notices are preserved verbatim.
+
+## 0.3.7 Post-login redirect behind a Host-rewriting proxy
+
+Some deployments (nginx being the common one) pin the upstream Host header with
+`proxy_set_header Host localhost;` so the backend keeps treating requests as loopback —
+which is what the core `/api` trust fence requires. The cost is that the 0.3.3 rule
+"redirect authority comes from the request Host" degrades to `http://localhost/?token=...`,
+sending a freshly authenticated browser to the wrong address.
+
+0.3.7 prefers `X-Forwarded-Host` when building that authority (nginx sets it from `$host`
+by default and overwrites any client-supplied value), and validates the value as a bare
+`host[:port]`: anything carrying credentials, a path, query or fragment is discarded and
+the previous `Host` behavior applies.
+
+| Headers | Redirect |
+|---|---|
+| `Host: localhost` + `X-Forwarded-Host: web.example.com` | `http://web.example.com/?token=...` |
+| `X-Forwarded-Host` absent / malformed / containing a path | identical to 0.3.6 |
+| direct loopback `Host: 127.0.0.1:3080` | `http://127.0.0.1:3080/?token=...` |
+
+Deployment notes:
+
+- `dsh web --public-url http://web.example.com` controls the printed/opened entry URL;
+- a non-loopback domain must also be trusted by the core
+  (`dsh web --trusted-host web.example.com`, i.e. `client-connection.trustedHosts`),
+  otherwise `/api` and WebSocket upgrades are still refused by the Host fence.
+
+A persistent WebUI authentication plugin for DeepSeek Harness. Once you create an account/password in **Settings → 身份认证 (Authentication)** or via the first-run login page, **unauthenticated browsers cannot load any WebUI resource, call any API, or open any realtime connection** — authentication is enforced at the HTTP/transport layer and cannot be bypassed through browser devtools.
+
+## Architecture
+
+Authentication is enforced in four layers, all implemented by **wrapping the webServer routes at runtime — no DSH core package source is modified**:
+
+| Layer | Mechanism | Unauthenticated behavior |
+|---|---|---|
+| WebUI resources (index.html, /assets/*, SPA routes) | Plugin registers a `prefix ''` catch-all route; after session validation it hands off to frontend-static | 302 → login page |
+| Plugin bundles (/plugins/*) | Wraps the `/plugins` prefix route handler at runtime | 401 |
+| /api RPC surface | Wraps the `/api` prefix route handler at runtime | 401 |
+| WebSocket (`/api/remote.mux`; legacy cores `/api/events.mux`, `/api/events.host`) | Wraps the upgrade route handlers at runtime | 401 upgrade rejected |
+
+- **No core patching**: a DSH upgrade never overwrites patches and never leaves `/api` exposed after an upgrade. Every startup re-wraps the route tables, with a 2s→10s rescan loop that catches late-registered routes. **On v0.1.2-alpha.2+ the event-stream WebSocket lives at `/api/remote.mux` (registered by dsh-api-gateway); the candidate list adapts automatically, so the plugin no longer falsely reports "upgrade route missing".**
+- **Top-level exact routes under the same prefixes are covered too (0.3.6)**: the router prefers an `exact` match over a `prefix` match, so wrapping the prefix alone misses members such as client-hmr's `/plugins/events` (an SSE channel) — on 0.3.5 and earlier an anonymous GET could read the **entire client plugin graph** (plugin ids, bundle URLs, revisions) and stay attached for rebuild events. Exact routes under `/api` and `/plugins` are now wrapped individually (including the late-registration rescan); the plugin's own endpoints (`/dsh-webui-auth/*`) are outside those prefixes and unaffected.
+- **Fail-closed**: if the expected routes are missing (DSH internals changed so wrapping can't apply), `setup`/`configure` **refuse to enable authentication** and the problem is reported both in the host log and on the settings page — better unusable than "login enabled with an unprotected /api".
+- **Cooperation with the core's own browser auth (v0.1.2-alpha.2+)**: that core version ships launch-token exchange with an origin-bound signed cookie (`dsh-auth-*`) guarding `/` and `/api`. After a successful plugin login the browser is automatically sent to the core's token-bearing root URL so the core cookie exchange runs too; `/api` requests pass through **unchanged** after the plugin session check (no more Host/Origin rewrite, which would break the core's cookie/Host binding). Both gates apply: a browser must hold the plugin session cookie **and** the core cookie.
+- **Privileged methods behind a reverse proxy / LAN (legacy cores ≤ alpha.1)**: after the session check the plugin hands authenticated requests to the core in a "loopback shape", so the core's **loopback-pinned privileged methods** (settings/credentials/agentPreset/llm.discoverModels) work in proxied deployments — the session-cookie gate is a strictly stronger identity proof than the Host-header heuristic it replaces.
+- **WebSocket and `trustedHosts`**: the WS upgrade handshake still goes through the core's own `requestRejection` / `isTrustedApiRequest`, so **in reverse-proxy / LAN deployments (non-loopback Host) you must also add the public hostname to `client-connection.trustedHosts` in the DSH config**, otherwise even authenticated upgrades are rejected.
+- **Scheme-adaptive post-login redirect (0.3.3, fixes #6 / #7)**: after a successful login the plugin sends the browser to the core's token-bearing root URL. Its **authority now comes from the request Host** (no longer hardcoded to `127.0.0.1`) and its **scheme follows the protocol the request actually used**, resolved in this order: ① the operator's explicit `remote-web-ui.publicBaseUrl` (**trusted only when its host/port matches the incoming Host** — otherwise a LAN direct hit would be redirected to the public address and lose the freshly issued session cookie to a cross-origin hop); ② the standard proxies headers `X-Forwarded-Proto` (leftmost value) or RFC 7239 `Forwarded: proto=`; ③ a TLS-terminating socket (`socket.encrypted`); ④ fallback `http`. It deliberately does **not** guess "non-IP hostname ⇒ https", which would turn plain-http intranet access (`http://nas.local:3080`) into a dead https link. The login page adds a one-way client-side fallback: an https page receiving a **same-origin** `http://` redirect upgrades it to `https://` (never downgrades, never rewrites another origin).
+
+- **Desktop marker pass-through (0.3.5, fixes #8)**: DSH Desktop's `advanced` / `extended` modes **disable the core `ui-layout` row** at the composition layer. That leaves the desktop's own client plugin as the only provider of the client `layout` service — and it **only activates when the URL carries the `dsh-desktop-*` markers** (`parseDesktopClientEnvironment()` returns undefined without them, so `apply()` returns immediately). Any redirect that lands on a clean `/` drops those markers → the 12 client plugins that depend on `layout` stay `pending` forever → the renderer never reports healthy within 30s → the host shows the "some plugins failed to load" recovery dialog.
+  Two marker-loss paths are confirmed: ① **first login** — the core's token→cookie exchange 303s the browser to a clean `/`; ② **logout then re-login** — logout is the client doing `location.href = '/'` itself, so the server never sees the marker-bearing URL being abandoned.
+  The fix is **proactive remembering**: whenever the renderer loads with markers in the URL, they are written into a cookie (`dsh_wua_desktop`, HttpOnly / SameSite=Lax / 12h). From then on, any document request that lands on a clean `/` is 302'd back to the marker-bearing URL. The restore happens **before the document loads**, so there is no race with the client plugins. The stash is **deliberately never cleared** — clearing would introduce a "remember → clear immediately → nothing left to restore after logout" ordering trap; expiry is left to Max-Age.
+  Markers are passed through by the `dsh-desktop-` prefix **as a whole** (deliberately not a hardcoded whitelist — a future marker added by DSH Desktop would otherwise silently break desktop startup again, the very coupling behind this issue); `mode` must be one of `compatibility`/`extended`/`advanced` and values are capped at 64 chars. The redirect target is always the same-origin relative path `/`, so there is **no open-redirect surface**; the web build (no `dsh-desktop-*` markers) is unaffected.
+  This adaptation lives **entirely in `lib/desktop-adapter.js`**; `index.js` keeps only two call sites in the gate (marked "宿主适配层"). The module imports nothing from the main module and can be removed wholesale — its header documents the design trade-offs, the removal steps, and the contract for adding further host adaptations (`{ remember(req,res), restore(req,res) }`).
+
+- **Host carrier bridge (0.3.6, fixes #9)**: In the official desktop app (DSH Desktop) the renderer's document and static assets are served locally by the shell from its own dist; everything else is forwarded to the Host by `forwardWebRequest` — which uses Node's global `fetch` and **discards `set-cookie` from the response**. A plugin-issued session cookie therefore **never lands anywhere** in the desktop app, so the desktop always looks "not logged in" to the plugin: `/api`, `/plugins` and the WebSocket all 401 and the whole Settings surface is dead. One step earlier it also kills startup: the shell exchanges this process's launch token for the core's own cookie and demands **303 + set-cookie** from the Host (`authenticateWebHost`, `redirect:"manual"`), while the plugin's document gate used to answer 302 → `Desktop Host authentication failed` → recovery-mode dialog whose only useful button is "disable third-party plugins".
+  0.3.6 makes way for a **loopback host-direct request the core has already authenticated** instead of adding a gate that carrier cannot satisfy:
+  - `coreAdmitsHost()` — the core's trust fence plus browser-session check already admit this request (i.e. the official extension point `ctx.connection.admit(request)` answers `operator`); used for `/api`, `/plugins`, the WebSocket and the plugin's own endpoints;
+  - `coreTokenExchange()` — the request *is* the core's own token→cookie exchange (`GET /?token=<process token>`); it is handed to the core untouched so the core can answer 303 + Set-Cookie.
+
+  Both apply to **loopback sockets only**, and the document gate (SPA/assets) deliberately accepts only the token exchange, never `coreAdmitsHost` — so **browsers still meet the login page** and remote/tunnelled clients still need the password. Loopback is already inside the trust boundary (a local process can read the session tokens and the core signing secret straight out of the data directory), so no real attack surface is conceded; and if the core shape changes (no `connection` service) both predicates return false, leaving the gate in its strict form — fail-closed.
+
+Sessions are **server-side and persisted to disk** (`sessions.jsonl`, survive a DSH restart, expire server-side), carried by an `HttpOnly; SameSite=Lax` cookie (`dsh_wua_session`) that JS cannot read; changing the password **revokes every other session**.
+
+## Installation
+
+This plugin is a standard **bundle**, published on npm — the official `dsh plugin` command is the recommended way to install it. The manual method is kept as a fallback. Prerequisite: pnpm on the machine (Node ships corepack — run `corepack enable pnpm` to activate it).
+
+### Method 1: npm install (recommended)
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
+```
+
+Pulls the prebuilt package from the npm registry (plain JS — no prepare script, no build authorization), adds the dependency and appends it to the `dsh.profile.bundles` list; the plugin row is inserted automatically via the bundle layer.
+
+### Method 2: GitHub install
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+```
+
+Fetches the repository source (works directly — no build step either). Prefer Method 1 when the network to GitHub is unreliable.
+
+### Method 3: manual (fallback)
+
+1. Put the `dsh-webui-auth` directory into `profiles/web/node_modules/`
+2. Add one row to the `insert` list in `profiles/web/cordis.patch.yml`:
+
+```yaml
+    - id: dsh-webui-auth
+      name: 'dsh-webui-auth'
+```
+
+> Maintainer dev mode: `dsh plugin --profile web add ./dsh-webui-auth` from a local source checkout (`link:` install) — edit code, restart DSH, done; no reinstall needed.
+>
+> Maintainer verification: `npm test` runs the offline regressions (`test/host-bridge.test.mjs` covers every admission branch of the host bridge and the gate); `node test/desktop-host-e2e.mjs` boots a **real Host** (same runtime, free port) and replays every request the desktop shell makes — ① 303 + set-cookie, ② `/api` RPC, ③ `/plugins` (including exact routes), ④ WebSocket upgrade, ⑤ the password gate. Add `--preflight-desktop` to rehearse the real `desktop` profile composition (both the plugin code and its data stay in a temp directory, so repo session files are never touched). `node test/desktop-live-check.mjs` is a read-only self-check of a **running desktop app** (plugin loaded? gate guarding? `/plugins/events` covered?).
+
+### Common to all methods
+
+**No core-package patches are needed** (no `[dsh-webui-auth patch]` markers, no `node_modules` edits) — just restart DSH. On startup the host log prints `[dsh-webui-auth] started, credentials file: ...`; if the route wrapping is incomplete it prints `ROUTE GATE INCOMPLETE` and authentication cannot be enabled (fail-closed).
+
+### Using it with the DSH desktop app
+
+The desktop app runs its own profile, `desktop` (`~/.dsh/profiles/desktop`), so the plugin must be installed into **that** profile:
+
+```sh
+npx @deepseek-ai/dsh plugin --profile desktop add dsh-webui-auth
+```
+
+You can also enable it for the `desktop` profile from the plugin manager panel, or add the mount row to `profiles/desktop/cordis.patch.yml` (method 3).
+
+After restarting the desktop app the host log should show:
+
+```
+[dsh-webui-auth] host carrier bridge active (core token exchange + core-authenticated loopback requests)
+```
+
+That line means the bridge is up: the desktop window is no longer stopped by the login page, and Settings → Authentication reports that **this connection uses the host-direct channel** (authenticated by DSH's own launch token). Account and audit management keep working. The password gate for browsers is unchanged.
+
+- **Desktop lock (0.3.6)**: the desktop window **cannot** be asked for the password at the transport layer — that is how the shell is built: `forwardWebRequest` **replaces** the `Cookie` header (it deletes `cookie`, then injects the core cookie the shell holds), `set-cookie` is dropped from relayed responses (`WITHHELD_RESPONSE_HEADERS`), and the renderer's document and static assets are served by the shell straight from its local dist (they never reach the Host). A plugin session cookie therefore never reaches the desktop app, and the server cannot make a password decision for it.
+  0.3.6 turns that into a **UI-level lock** that still gives you both behaviours: the desktop shows an unlock screen on every load and only lifts it for a valid unlock token; the token is kept by the client — **"browser session" lives in sessionStorage (closing or restarting the desktop app really does require the password again, which is what that setting promises)**, while 1 hour / 1 day / 3 days live in localStorage with an expiry. "Log out and lock" now **revokes the server-side session and re-locks immediately** instead of appearing to do nothing.
+  Be clear about the boundary: this is a **screen lock** — it stops a person walking past from seeing the interface; it is not a transport gate (the desktop's network channel is always authenticated by DSH itself). Any failure in the lock fails open within 8 seconds, so the desktop can never be locked out; if the password is forgotten, follow the "forgot password" flow (delete `dsh-webui-auth.json` from the plugin data directory) and reload.
+- To verify the **transport-level** gate, open DSH's address in a **browser** (`dsh web`'s printed URL, a LAN address, or the reverse-proxy address) — that is where the login page appears.
+
+- **0.3.5 and earlier fail at desktop startup** (`Desktop Host authentication failed`, and the recovery dialog only offers "disable third-party plugins"); upgrade to 0.3.6 first.
+- If the log instead prints `host carrier bridge unavailable: ...`, the core lacks the `connection.authenticatedUrl` contract; the gate then falls back to its strict form and the desktop app is blocked (please report that log line).
+
+Self-check after the restart (two read-only commands; `19387` is the desktop Host's fixed port):
+
+```powershell
+# ① Is the plugin live inside the desktop Host? {"error":"unauthorized"} means loaded and gating.
+#    (Without the plugin this JSON body does not exist.)
+curl.exe -s http://127.0.0.1:19387/dsh-webui-auth/status
+
+# ② Is the password gate still guarding? An anonymous root request must 302 to /dsh-webui-auth/login.
+curl.exe -s -i http://127.0.0.1:19387/ | Select-String 'HTTP/|location'
+```
+
+## Uninstallation
+
+### Method 1: `dsh plugin` command (for method-1 installs)
+
+1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth` (removes both the dependency and the bundle layer)
+2. Restart DSH
+
+### Method 2: manual (for method-2 installs)
+
+1. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (since 0.3.1 runtime data lives outside the package, deleting it does not touch the account; to wipe the account too, also delete the `.dsh-webui-auth/` data directory — see "Data file locations")
+2. **Remove the mount row** from `profiles/web/cordis.patch.yml`:
+
+```yaml
+    - id: dsh-webui-auth
+      name: 'dsh-webui-auth'
+```
+
+   This step is required — otherwise the loader fails at startup because the package is missing.
+3. **Restart DSH**
+
+With either method, after the restart authentication is fully disabled (**no core sources to restore** — the plugin never modified core files). To also clear persisted sessions, delete `sessions.jsonl` in the data directory. If you previously used the older pre-hardening build, the leftover `dsh-webui-auth.session` key in browser localStorage is harmless and may be removed optionally.
+
+## Usage
+
+- **First enable (setup token required)**: while no credentials exist, authentication is off (all requests pass), but creating the administrator account requires a **per-boot setup token** — open WebUI → Settings → 身份认证 (Authentication), or visit `/dsh-webui-auth/login`, enter the token printed in the startup log as `[dsh-webui-auth] setup token (...)` (or read the `setup-token` file in the data directory, mode 0600), then create an account/password (≥8 characters, must include uppercase, lowercase, digit and special character). The token is regenerated on every boot and deleted once setup succeeds, preventing someone from claiming the administrator account in the "exposed before configured" window.
+- **Username rule**: 3-32 characters of letters, digits, underscore or hyphen (enforced on create/change; legacy accounts are unaffected and can still log in).
+- **Afterwards**: any unauthenticated visit to any path redirects to the login page; after login you stay signed in for the chosen **session lifetime** (browser session / 1 hour / 12 hours (default) / 1 day / 3 days), enforced server-side by expiry. **Sessions are persisted to disk — after a DSH restart logged-in devices stay signed in** (the expiry still applies). "Browser session" mode: the 30-minute window slides with activity, and closing the browser logs you out.
+- **Change / disable / log out**: Settings → 身份认证 (all require the current password); changing the password revokes every other logged-in session.
+- **Forgot password**: delete `dsh-webui-auth.json` in the data directory — a background check every minute disables authentication within at most 1 minute (no restart needed), then create a new account with a fresh setup token.
+
+## Where data files live (depends on install mode)
+
+Credentials and security data are stored in the **runtime data directory**, chosen automatically by install mode:
+
+- **npm / GitHub / tarball installs**: the package lives inside `node_modules`, which is wholesale replaced on upgrade, reinstall or cleanup — so data is stored in a `.dsh-webui-auth/` directory **next to that `node_modules`** (usually the profile root, e.g. `~/.dsh/profiles/web/.dsh-webui-auth/`). Upgrading the plugin, `pnpm clean`, or reinstalling DSH no longer loses the account or login sessions.
+- **Local link / source installs** (`dsh plugin add ./dsh-webui-auth`): the plugin source directory itself (managed with the repo and excluded from git via `.gitignore`; deleting the whole source checkout is what deletes the data).
+- **Fallback**: when none of the above is writable, `$DSH_HOME/dsh-webui-auth/` (default `~/.dsh/dsh-webui-auth/`) is used.
+
+Upgrading from 0.3.x: runtime data is **not migrated automatically**. If the legacy data (inside the package directory or `~/.dsh/dsh-webui-auth/`) still exists, copy `dsh-webui-auth.json`, `sessions.jsonl`, `audit-hmac-key` and `audit.jsonl` from the table below into the new data directory manually (for npm / GitHub / tarball installs that is `.dsh-webui-auth/` next to `node_modules`); otherwise just recreate the account with a fresh setup token (see "Forgot password").
+
+Files in the data directory:
+
+| File | Purpose | Permissions |
+|---|---|---|
+| `dsh-webui-auth.json` | Credentials (scrypt hash, v3 format; 0.2.x v2 credentials still verify and log in) | — |
+| `audit.jsonl` | Audit log (IPs pseudonymized, see "Audit log") | — |
+| `sessions.jsonl` | Persisted sessions (restart recovery) | 0600 |
+| `audit-hmac-key` | HMAC key for audit-IP pseudonymization (auto-generated once) | 0600 |
+| `setup-token` | First-run setup token (deleted after setup succeeds) | 0600 |
+
+The data directory is chosen by install mode (npm / GitHub / tarball → `.dsh-webui-auth/` next to `node_modules`; link / source → the plugin source directory; fallback `$DSH_HOME/dsh-webui-auth/`); the "forgot password", audit and session paths above refer to that data directory.
+
+## Audit log
+
+Security events — login success/failure/rate-limit, setup, configure, disable, logout — are **appended as JSONL to `audit.jsonl`** in the data directory (timestamp, username, IP, user-agent, detail). **Client IPs are pseudonymized with HMAC-SHA256** (e.g. `hmac:5151e752|203.0.113.0/24`, with the /24 (IPv4) or /64 (IPv6) network prefix kept in cleartext for aggregation); raw addresses are never written to disk. Two ways to view:
+
+- **CLI** (recommended): run `node index.js audit [--limit N]` (last 20 entries by default; run from the module path):
+  ```sh
+  node index.js audit --limit 50
+  ```
+- **Settings page**: Settings → 身份认证 → "最近登录记录" (Recent activity) shows the last 8 entries.
+
+Audit write failures never block authentication (only a host-log warning).
+
+## Appearance
+
+Both the login page and the "Settings → 身份认证 (Authentication)" settings page follow DSH's **built-in appearance setting** (Settings → General → Appearance: Light / Dark / System); no separate appearance switch is provided. The settings page lives inside the WebUI and consumes DSH's theme tokens directly, so it tracks light/dark automatically. The login page is a standalone page: the server reads the current appearance preference (settings `ui-theme.preference`), injects it into the page, and the page mirrors DSH's boot logic — `System` resolves via `prefers-color-scheme` and reacts live to OS changes. The login response is served with `cache-control: no-store`, so a refresh picks up any appearance change immediately.
+
+## What to do after upgrading DSH
+
+**Nothing.** The plugin never modifies core packages — after a DSH upgrade the runtime route wrapping is re-applied automatically on startup. **On v0.1.2-alpha.2+** the plugin adapts to the `/api/remote.mux` event-stream route and cooperates with the core's built-in browser auth (launch-token ↔ signed cookie): after logging into the plugin, the browser is automatically guided through the core authentication, after which the WebUI works normally. If the wrapping is incomplete (DSH internals changed), the host log prints `ROUTE GATE INCOMPLETE`, the settings page shows a red warning, and `setup`/`configure` refuse to enable authentication (fail-closed).
+
+> **Note (v0.1.2-alpha.2+)**: the core's browser auth requires the browser to first exchange the launch token for the core cookie (the `?token=` URL printed by `dsh web` / DSH Desktop). The plugin performs that exchange automatically; if a browser has never visited that address, open the full URL printed at DSH startup once (or log in via the plugin's login page — the exchange happens automatically).
+
+## Data & Security
+
+- Passwords are hashed with **scrypt** (Node's built-in memory-hard KDF — GPU/ASIC resistant, zero dependencies) and stored in `dsh-webui-auth.json` in the data directory (location depends on install mode, see above); plaintext is never written to disk. Credentials format is v3 (same scrypt encoding as v2 — only the version marker and field semantics changed); **0.2.x v2 credentials still verify**. **Since 0.2.0 only scrypt hashes are accepted**: 0.1.x SHA-256 credentials can no longer be verified — delete the credentials file and recreate the account (see "Forgot password").
+- Login rate limiting: **per client IP**, at most 5 failures per minute — a single attacker can no longer lock out other users (or the operator). Behind a reverse proxy the client IP is taken from `CF-Connecting-IP` / the leftmost `X-Forwarded-For`, and the proxy headers are trusted **only when the socket peer is loopback** (local caddy/cloudflared) — remote callers cannot spoof them. Failed verifications also run a dummy scrypt pass so "unknown account" and "wrong password" take the same time, defeating username enumeration via response timing.
+- First-run setup requires a **per-boot setup token** (128-bit, printed to the host log and written to `setup-token` in the data directory, mode 0600), preventing account claiming in the "exposed before configured" window.
+- Audit log: `audit.jsonl`, client IPs pseudonymized with HMAC (see "Audit log").
+- Persisted sessions: `sessions.jsonl` (0600), restored on restart; a write failure never affects authentication — the settings page just warns that a restart will require re-login.
+- Security headers on the login page and API responses: strict CSP, `nosniff`, `DENY` framing, `no-referrer`, `noindex`, `no-store`.
+- Cookie `HttpOnly + SameSite=Lax`: not readable by JS, not sent on cross-site requests.
+- The login/setup endpoints are intentionally public (the entry point of authentication): `/dsh-webui-auth/login` and `/dsh-webui-auth/setup` (the latter protected by the setup token).
+
+## Known limits
+
+- **The desktop app does not go through the password gate (since 0.3.6)**: the desktop renderer's requests are forwarded by the shell proxy, which stores no session cookies (it drops `set-cookie`), and a custom-scheme page has no usable cookie jar — so the desktop can only enter through the host-direct channel and cannot "log in inside the desktop". By design this is equivalent to "the desktop already holds the host launch token", the same trust boundary as "a local process can read the data directory"; the password gate guards the browser line (`dsh web`, LAN, reverse proxy).
+- **The host-direct exemption is loopback-only**: a non-loopback client is still asked for the password even if it holds a core cookie or knows the launch token (the document gate only passes the token exchange, never the core-admitted predicate). Local reverse proxies (caddy/cloudflared) and SSH tunnels also look loopback to the Host and cannot be told apart from the desktop app, but such visitors are already inside the machine's trust boundary (they can read the session tokens in the data directory).
+- **Inherent runtime-wrapping window**: between a route-object replacement (service hot-reload) and the next rescan (≤10s) there is an unprotected window; the fail-closed check on enabling covers the "initially exposed" case, so this window only affects hot-reload during runtime.
+- **WebSocket and `trustedHosts`**: in reverse-proxy / LAN deployments (non-loopback Host), WS downlinks need the public hostname added to `client-connection.trustedHosts` in the DSH config (see "Architecture").
+- **Proxy on a different host**: if the reverse proxy is not on the same machine as DSH (non-loopback peer), the proxy headers are not trusted and rate limiting aggregates per proxy IP (degrades to a global bucket).
+- **HTTPS proxy that sends no protocol header**: the post-login redirect scheme depends on ① `remote-web-ui.publicBaseUrl` or ② an `X-Forwarded-Proto` / `Forwarded` header from the proxy. With neither, it can only fall back to `http` (the browser then handshakes against the TLS port and the page looks frozen after clicking Login). Pick one: declare the public address in `settings.yaml`, or make the proxy send `proxy_set_header X-Forwarded-Proto $scheme;`. Note `publicBaseUrl` only applies when it matches the request Host, which is what keeps LAN direct access from being rewritten to the public address.
+- **`--trusted-host` is not optional**: after desktop password login, requests that hit `/api` directly depend on `--trusted-host <public-host:port>`; the remote-web-ui pairing flow (`/remote` channel) does not. Dropping the flag makes every `/api` call return 403.
+- **Limits of audit pseudonymization**: the HMAC key lives in the same data directory (0600); a local attacker who can read it can brute-force the IP space — pseudonymization protects against "plaintext IPs at rest", not against an attacker with file access.
+- Sessions live in `sessions.jsonl`: they survive restarts (expiry unchanged); uninstalling/disabling the plugin does not affect credentials.
+- Threat model is "browser/network clients": local processes that can read/write the host's memory or files are out of scope.

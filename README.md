@@ -1,0 +1,238 @@
+# dsh-webui-auth
+
+[English](README.en.md) | 中文
+
+> **仓库说明**：本仓库基于 npm 包 `dsh-webui-auth@0.3.6`（MIT，© 2026 Yuuz12），
+> 追加 0.3.7 补丁（反代改写 `Host` 时的登录跳转修复，见 [CHANGELOG](CHANGELOG.md)）。
+> 许可证与版权声明原样保留。
+
+## 0.3.7 登录跳转：反代强制改写 Host 时的修复
+
+部分部署（典型是 nginx）会把上游请求头固定改写为 `proxy_set_header Host localhost;` ——
+这样后端才能按回环信任处理 `/api`。代价是 0.3.3 的「跳转 authority 取自本次请求 Host」
+会退化成 `http://localhost/?token=…`，登录成功后浏览器被送往错误地址。
+
+0.3.7 在构造跳转 authority 时**优先采用 `X-Forwarded-Host`**（nginx 默认
+`proxy_set_header X-Forwarded-Host $host;` 覆盖写入，客户端无法伪造），并做严格形状校验：
+只接受裸 `host[:port]`，含凭据、路径、查询、片段的值一律丢弃，校验失败才回退到原来的 `Host`。
+
+| 请求头 | 跳转结果 |
+|---|---|
+| `Host: localhost` + `X-Forwarded-Host: web.example.com` | `http://web.example.com/?token=…` |
+| `X-Forwarded-Host` 缺失 / 形状非法 / 带路径 | 与 0.3.6 行为完全一致 |
+| 直连回环 `Host: 127.0.0.1:3080` | `http://127.0.0.1:3080/?token=…` |
+
+部署侧配套：
+
+- `dsh web --public-url http://web.example.com` 决定打印/打开的入口地址；
+- 非回环域名还需加入核心信任列表（`dsh web --trusted-host web.example.com`，等价于
+  `client-connection.trustedHosts`），否则核心 `/api` 与 WebSocket 仍按 Host 栅栏拒绝。
+
+DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认证」或首次访问登录页创建账号密码后，**未认证的浏览器无法加载 WebUI 的任何资源、调用任何接口或建立任何实时连接**——认证在 HTTP/传输层强制执行，不可通过浏览器开发者工具绕过。
+
+## 架构
+
+认证由四层组成，全部通过**运行时包装 webServer 路由**实现，**不改动任何 DSH 核心包源码**：
+
+| 层 | 机制 | 未认证行为 |
+|---|---|---|
+| WebUI 资源（index.html、/assets/*、SPA 路由） | 插件注册 `prefix ''` 兜底路由，校验会话后转交 frontend-static | 302 → 登录页 |
+| 插件 bundle（/plugins/*） | 运行时包装 `/plugins` 前缀路由 handler | 401 |
+| /api RPC 接口 | 运行时包装 `/api` 前缀路由 handler | 401 |
+| WebSocket（`/api/remote.mux`；旧核心 `/api/events.mux`、`/api/events.host`） | 运行时包装 upgrade 路由 handler | 401 拒绝升级 |
+
+- **不修改核心包**：dsh 升级不会覆盖补丁、不会产生「升级后 /api 裸奔」的窗口。插件每次启动对路由表重做包装，并用 2s→10s 重扫捕获晚注册路由。**v0.1.2-alpha.2 及更新核心的事件流 WebSocket 位于 `/api/remote.mux`（由 dsh-api-gateway 注册），候选列表自动适配，不再误报「upgrade 路由缺失」。**
+- **同前缀的顶层 exact 路由同样纳管（0.3.6）**：路由表对 `exact` 的优先级高于 `prefix`，只包装 prefix 会漏掉 client-hmr 的 `/plugins/events`（SSE 通道）这类成员——0.3.5 及更早版本实测匿名 GET 即可读到**整个客户端插件图**（插件 id、bundle URL、revision）并长期挂着接收 rebuild 事件。现在 `/api`、`/plugins` 前缀下的顶层 exact 路由会被逐个包装（含晚注册重扫）；插件自身端点（`/dsh-webui-auth/*`）不在受保护前缀下，不受影响。
+- **fail-closed**：若预期路由缺失（dsh 内部结构变化导致包装不上），`setup`/`configure` 会**拒绝启用认证**，并在宿主日志与设置页同时报错——宁可不可用，不可「开了登录却裸奔 /api」。
+- **与核心自带浏览器认证（v0.1.2-alpha.2+）协作**：该版本核心自带 launch-token 交换的签名 Cookie（`dsh-auth-*`）认证 `/` 与 `/api`。插件登录成功后自动把浏览器引导到核心的带 token 根 URL 完成核心 Cookie 交换；`/api` 请求在插件会话校验后**原样转交**给核心（不再改写 Host/Origin，避免破坏核心 Cookie 与 Host 绑定）。两者叠加：浏览器须同时持有插件会话 Cookie 与核心 Cookie。
+- **反代/局域网旧核心下的特权方法**（≤alpha.1）：已认证请求由插件在会话校验后以「回环形状」转交核心，使核心中**回环钉死的特权方法**（settings/credentials/agentPreset/llm.discoverModels）在反代部署下可用——会话 Cookie 闸门是比 Host 启发式更强的身份证明。
+- **WebSocket 与 trustedHosts**：WS 升级握手仍受核心自身 `requestRejection` / `isTrustedApiRequest` 限制，因此**反代/局域网（非回环 Host）部署下，WS 下行需要同时在 dsh 配置中把对外域名加入 `client-connection.trustedHosts`**，否则即使已登录也会被拒绝升级。
+- **登录后跳转的协议自适应（0.3.3，修 #6 / #7）**：插件登录成功后要把浏览器引导到核心的带 token 根地址，其 **authority 取自本次请求的 Host**（不再写死 `127.0.0.1`），**scheme 按请求实际协议解析**，优先级：① 操作者显式声明 `remote-web-ui.publicBaseUrl`（**仅当其 host/port 与本次请求 Host 一致时**采信——否则局域网直连会被重定向到公网地址、跨源丢掉刚下发的会话 Cookie）；② 标准代理头 `X-Forwarded-Proto`（取最左值）或 RFC 7239 `Forwarded: proto=`；③ socket 自身是 TLS（插件直接终结 TLS）；④ 兜底 `http`。**刻意不做「非 IP 域名即 https」的猜测**——那会把纯 http 的内网域名访问（`http://nas.local:3080`）打成 https 死链。前端登录页另有一层单向兜底：页面在 https 下收到**同源** `http://` 跳转时自动升级为 `https://`（反向不降级、异源不改写）。
+
+- **桌面端标记透传（0.3.5，修 #8）**：DSH Desktop 的 `advanced` / `extended` 模式会在组合层**禁用核心 `ui-layout` 行**，此时客户端 `layout` 服务的唯一提供者是桌面端自己的客户端插件，而它**只在 URL 带 `dsh-desktop-*` 标记时才生效**（标记缺失时 `parseDesktopClientEnvironment()` 返回 undefined，`apply()` 直接 return）。任何一次落到干净 `/` 的跳转都会丢掉这些标记 → 12 个依赖 `layout` 的客户端插件永远停在 `pending` → 渲染器 30s 不上报健康 → 宿主弹出「部分插件加载失败」恢复模式对话框。
+  已确认两条丢标记的路径：① **首次登录**——核心 token→cookie 交换把浏览器 303 到干净的 `/`；② **退出后重登**——退出登录是客户端自行 `location.href = '/'`，服务端从头到尾没看到那个带标记的 URL 被放弃。
+  对策是**主动记忆**：渲染器正常加载（URL 带标记）时就把标记写进 Cookie（`dsh_wua_desktop`，HttpOnly / SameSite=Lax / 12h），此后任何一步丢标记，只要文档请求落到干净的 `/`，就 302 回带标记的 URL。补投发生在**文档加载之前**，与客户端插件之间不存在竞态。暂存**刻意不清除**——清除会引入「记住 → 立刻清掉 → 退出后无处可补」的时序陷阱，过期交给 Max-Age。
+  标记按 `dsh-desktop-` 前缀**整体透传**（刻意不做硬编码白名单——DSH Desktop 将来新增一个标记时会再次静默弄坏桌面端启动，正是本 issue 的同类耦合），其中 `mode` 必须是 `compatibility`/`extended`/`advanced` 之一、值长度上限 64；跳转目标恒为同源相对路径 `/`，**无开放重定向面**；网页版（无 `dsh-desktop-*` 标记）零影响。
+  这套适配**全部隔离在 `lib/desktop-adapter.js`**，`index.js` 只保留网关里的两处调用点（标着「宿主适配层」）。该模块不 import 主模块任何东西，可整体摘除；文件头写明了设计取舍、移除步骤，以及新增其它宿主适配的接口约定（`{ remember(req,res), restore(req,res) }`）。
+
+- **宿主直连信任桥（0.3.6，修 #9）**：官方桌面端（DSH Desktop）的渲染器文档与静态资源由 shell 自己从本地 dist 提供，其余请求经 `forwardWebRequest` 转发给宿主——而该转发用 Node 全局 `fetch`，并**把响应里的 `set-cookie` 一并丢弃**。插件下发的会话 Cookie 在桌面端**永远落不了地**，于是桌面端在插件眼里始终「未登录」：`/api`、`/plugins`、WebSocket 全 401，设置页整片打不开。更早一步还会直接卡死启动：shell 启动时用本进程 launch token 换核心自己的 Cookie，要求宿主回 **303 + set-cookie**（`authenticateWebHost`，`redirect:"manual"`），插件的文档闸门原先回 302 → 桌面端抛 `Desktop Host authentication failed` → 恢复模式对话框（只能选「禁用第三方插件」）。
+  0.3.6 改为给「**已经被核心自己认证过的回环宿主直连**」让路，而不是再加一道它无法满足的门：
+  - `coreAdmitsHost()`——核心的信任栅栏 + 浏览器会话校验已放行该请求（即官方扩展点 `ctx.connection.admit(request)` 会答出 operator），用于 `/api`、`/plugins`、WebSocket 与插件自身端点；
+  - `coreTokenExchange()`——该请求就是核心自己的 token→cookie 交换（`GET /?token=<本进程令牌>`），原样交给核心，让它下发 303 + Set-Cookie。
+
+  两者**只对回环 socket 生效**；文档闸门（SPA / 资源）刻意只放行 token 交换、**不**接受 `coreAdmitsHost`，所以**浏览器访问 WebUI 依旧会看到登录页**，远端/隧道客户端依旧必须输入口令。回环本身已在信任边界之内（同机进程可直接读数据目录里的会话令牌与核心签名密钥），因此这不让渡任何实际可利用面；核心结构变化（拿不到 `connection` 服务）时两个判定都返回 false，闸门退回严格形态——fail-closed。
+
+会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
+
+## 安装
+
+本插件是标准**组合包（bundle）**，已发布到 npm，推荐用 DSH 官方 `plugin` 命令安装；手动方式保留作备用。前提：机器上有 pnpm（Node 自带 corepack，执行 `corepack enable pnpm` 即可启用）。
+
+### 方式一：npm 安装（推荐）
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
+```
+
+从 npm registry 拉取预构建代码（纯 JS 包，无 prepare 脚本、无需构建授权），加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。
+
+### 方式二：GitHub 安装
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+```
+
+拉取仓库源码（同样直接可用，无需构建步骤）；网络不佳时优先用方式一。
+
+### 方式三：手动（备用）
+
+1. 将 `dsh-webui-auth` 目录放入 `profiles/web/node_modules/`
+2. 在 `profiles/web/cordis.patch.yml` 的 `insert` 列表中加一行：
+
+```yaml
+    - id: dsh-webui-auth
+      name: 'dsh-webui-auth'
+```
+
+> 维护者开发模式：在本地源码目录使用 `dsh plugin --profile web add ./dsh-webui-auth`（`link:` 安装），改代码 → 重启 DSH 即生效，无需重新安装。
+>
+> 维护者验证：`npm test` 跑离线回归（`test/host-bridge.test.mjs` 覆盖宿主桥与闸门的全部准入分支）；`node test/desktop-host-e2e.mjs` 会拉起**真宿主**（同一 runtime、自由端口）复刻桌面端 shell 的每一条请求，验证 ① 303 + set-cookie、② `/api` RPC、③ `/plugins`（含 exact 路由）、④ WebSocket 升级、⑤ 口令闸门五组行为；加 `--preflight-desktop` 可预演真实 `desktop` profile 的组合（插件代码与数据都隔离在临时目录，不会碰到仓库里的会话文件）。`node test/desktop-live-check.mjs` 则是对**正在运行的桌面端**做只读自检（插件是否加载、闸门是否在守、`/plugins/events` 是否已被覆盖）。
+
+### 所有方式通用
+
+安装后**无需任何核心包补丁**（无 `[dsh-webui-auth patch]` 标记、不改 `node_modules`），重启 DSH 即生效。插件启动时在宿主日志打印 `[dsh-webui-auth] started, credentials file: ...`；若路由包装不完整会打印 `ROUTE GATE INCOMPLETE`，此时认证无法启用（fail-closed）。
+
+### 在 DSH 桌面端使用（DSH Desktop）
+
+桌面端跑的是独立 profile `desktop`（`~/.dsh/profiles/desktop`），所以插件要装到**那个** profile：
+
+```sh
+npx @deepseek-ai/dsh plugin --profile desktop add dsh-webui-auth
+```
+
+也可以直接在插件管理面板里为 `desktop` profile 启用，或按「方式三」把挂载行写进 `profiles/desktop/cordis.patch.yml`。
+
+重启桌面端后，宿主日志应出现：
+
+```
+[dsh-webui-auth] host carrier bridge active (core token exchange + core-authenticated loopback requests)
+```
+
+看到这行就说明桥已就绪：桌面端窗口不再被登录页拦住，「设置 → 身份认证」会提示**当前连接走宿主直连通道**，账号密码管理与审计记录照常可用。口令闸门对浏览器照旧生效。
+
+- **桌面端锁（0.3.6）**：桌面端窗口**无法**在传输层要求口令——这是 shell 结构决定的：`forwardWebRequest` 转发前会**替换** `Cookie` 头（先 `delete('cookie')`，再注入 shell 手里的核心 Cookie），响应里的 `set-cookie` 又被丢弃（`WITHHELD_RESPONSE_HEADERS`），而渲染器的文档与静态资源还是 shell 从本地 dist 直接提供的（根本不进宿主）。所以插件会话 Cookie 永远进不了桌面端，服务端也就做不了口令判定。
+  0.3.6 改为 **UI 级锁**把这件事做对：桌面端每次加载先盖一层解锁界面，只有拿着有效解锁令牌才揭开；令牌由客户端自己保存——**「浏览器会话」存 sessionStorage（关掉或重启桌面端必须重新输口令，正是这个选项该有的语义）**，1 小时 / 1 天 / 3 天存 localStorage 且到期前免输。「退出登录并锁定」会**吊销服务端会话并立即重新上锁**，不再是"点了没反应"。
+  边界要说清楚：这是**界面锁**，挡的是「人离开时看到界面」，不是传输层闸门——桌面端的网络通道始终由 DSH 自身认证。锁的任何一步失败都会在 8 秒内自动放行，绝不会把桌面端锁死；忘记密码时按「忘记密码」流程删除插件数据目录的 `dsh-webui-auth.json` 后刷新即可解锁。
+- 想验证**传输层**口令闸门，请用**浏览器**打开 DSH 的地址（`dsh web` 打印的地址 / 局域网地址 / 反代地址）——那里才会出现登录页。
+
+- **0.3.5 及更早版本在桌面端会在启动时直接失败**（`Desktop Host authentication failed`，恢复模式对话框里只能选「禁用第三方插件」）；0.3.6 起适配，请先升级。
+- 若日志打印的是 `host carrier bridge unavailable: ...`，说明核心版本缺少 `connection.authenticatedUrl` 契约；此时闸门退回严格形态，桌面端会被拦（请连同该日志反馈）。
+
+重启后自查（两条只读命令，`19387` 是桌面端宿主固定端口）：
+
+```powershell
+# ① 插件是否已在桌面端宿主里生效 —— 返回 {"error":"unauthorized"} 即插件已加载、闸门已启用
+#    （插件未加载时这里不会有这个 JSON 体）
+curl.exe -s http://127.0.0.1:19387/dsh-webui-auth/status
+
+# ② 口令闸门是否仍在守门 —— 无凭据访问根路径应 302 到 /dsh-webui-auth/login
+curl.exe -s -i http://127.0.0.1:19387/ | Select-String 'HTTP/|location'
+```
+
+## 卸载
+
+### 方式一：`dsh plugin` 命令（对应方式一安装）
+
+1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth`（同时移除依赖与组合包层）
+2. 重启 DSH
+
+### 方式二：手动（对应方式二安装）
+
+1. 删除插件目录 `profiles/web/node_modules/dsh-webui-auth/`（0.3.1 起运行数据在包外，删它不影响账号；如需连账号一起清除，另删数据目录 `.dsh-webui-auth/`，见「数据文件位置」）
+2. 从 `profiles/web/cordis.patch.yml` 移除挂载行：
+
+```yaml
+    - id: dsh-webui-auth
+      name: 'dsh-webui-auth'
+```
+
+   此步必须做，否则重启时加载器找不到插件包会报错
+3. 重启 DSH
+
+两种方式重启后认证门禁完全关闭（**无需恢复任何核心包源码**——插件从未修改核心文件）。如需清除持久化会话，删除数据目录中的 `sessions.jsonl` 即可；如曾用旧版插件，可清除浏览器 localStorage 中的 `dsh-webui-auth.session` 残留（无害）。
+
+## 使用
+
+- **首次启用（需 setup token）**：未配置凭据时认证自动关闭（所有请求放行），但创建管理员账号需要**本次启动生成的 setup token**——打开 WebUI → 设置 → 身份认证，或访问 `/dsh-webui-auth/login`，输入启动日志中打印的 `[dsh-webui-auth] setup token (...)`（或数据目录 `setup-token` 文件内容，0600）后创建账号密码（≥8 位，含大小写字母、数字、特殊符号）。token 每次启动重新生成、创建成功后即删除，防止「先暴露、后配置」窗口内被他人抢先注册。
+- **用户名规则**：3-32 位字母、数字、下划线或连字符（新建/修改时强制；旧账号不受影响，仍可正常登录）。
+- **之后**：未登录访问任意路径 → 跳转登录页；登录后按「会话有效期」免登录（浏览器会话 / 1 小时 / 12 小时（默认）/ 1 天 / 3 天），服务端按到期时间强制失效。**会话持久化到磁盘，重启 DSH 后已登录设备无需重新登录**（到期时间仍生效）。「浏览器会话」模式：活跃使用期间自动续期（30 分钟窗口），关闭浏览器即失效。
+- **修改 / 禁用 / 退出**：设置 → 身份认证（均需当前密码）；修改密码会吊销其他所有已登录会话。
+- **忘记密码**：删除数据目录的 `dsh-webui-auth.json` 即可——后台每分钟自动检测，最多 1 分钟内认证自动关闭（无需重启），之后用新的 setup token 重新创建账号即可。
+
+## 数据文件位置（按安装方式区分）
+
+凭据与安全数据存放在**运行时数据目录**，按安装方式自动选择：
+
+- **npm / GitHub / tarball 安装**：插件包体位于 `node_modules` 内，会随升级、重装、清理被整目录替换——数据因此存放在**该 `node_modules` 的上级目录**下的 `.dsh-webui-auth/`（通常即 profile 根，如 `~/.dsh/profiles/web/.dsh-webui-auth/`）。升级插件、`pnpm clean`、重装 DSH 都不会丢失账号密码与登录会话。
+- **本地 link / 源码安装**：为插件源码目录（随仓库管理、已被 `.gitignore` 排除出 git；删除整个源码目录才会连数据一起清除）。
+- **兜底**：以上位置均不可写时回退到 `$DSH_HOME/dsh-webui-auth/`（默认 `~/.dsh/dsh-webui-auth/`）。
+
+从 0.3.x 升级：运行数据**不自动迁移**。若旧位置（包内目录或 `~/.dsh/dsh-webui-auth/`）的数据还在，可把下表中的 `dsh-webui-auth.json`、`sessions.jsonl`、`audit-hmac-key`、`audit.jsonl` 手动拷入新数据目录（npm / GitHub / tarball 安装即 `node_modules` 上级的 `.dsh-webui-auth/`）；否则按「忘记密码」流程用新 setup token 重建账号即可。
+
+目录内文件：
+
+| 文件 | 用途 | 权限 |
+|---|---|---|
+| `dsh-webui-auth.json` | 凭据（scrypt 哈希，v3 格式；0.2.x 的 v2 凭据仍可正常登录校验） | — |
+| `audit.jsonl` | 审计日志（IP 已假名化，见「审计日志」节） | — |
+| `sessions.jsonl` | 持久化会话（重启恢复用） | 0600 |
+| `audit-hmac-key` | 审计 IP 假名化的 HMAC 密钥（首次自动生成） | 0600 |
+| `setup-token` | 首次初始化的 setup token（创建成功后删除） | 0600 |
+
+数据目录由安装方式决定（npm / GitHub / tarball → `node_modules` 上级的 `.dsh-webui-auth/`；link / 源码 → 插件源码目录；兜底 `$DSH_HOME/dsh-webui-auth/`），忘记密码、审计、会话路径均指该目录。
+
+## 审计日志
+
+登录成功/失败/限流、初始化、修改凭据、禁用、退出等安全事件**追加写入数据目录的 `audit.jsonl`**（JSONL 格式，含时间、用户名、IP、UA、详情）。**客户端 IP 以 HMAC-SHA256 假名化存储**（形如 `hmac:5151e752|203.0.113.0/24`，附 /24（IPv4）或 /64（IPv6）网络前缀用于聚合分析），原始 IP 不落盘。两种查看方式：
+
+- **CLI**（推荐）：运行 `node index.js audit [--limit N]`（默认最近 20 条，从模块所在路径运行即可）：
+  ```sh
+  node index.js audit --limit 50
+  ```
+- **设置页**：设置 → 身份认证 → 「最近登录记录」展示最近 8 条。
+
+审计写入失败不影响认证主流程（仅记宿主日志）。
+
+## 外观
+
+登录页与「设置 → 身份认证」设置页都跟随 DSH **自带的外观设置**（设置 → 通用 → 外观：浅色 / 深色 / 跟随系统），不提供独立的外观开关。设置页运行在 WebUI 内，直接消费 DSH 的主题 token，天然随明暗切换；登录页是独立页面，由服务端读取当前外观偏好（settings `ui-theme.preference`）注入页面，并复刻 DSH 的 boot 逻辑：`跟随系统` 时按 `prefers-color-scheme` 解析、系统明暗切换时实时变化。登录页响应带 `cache-control: no-store`，外观变更后刷新即可生效。
+
+## 升级 DSH 后的操作流程
+
+**无需任何操作**：插件不修改核心包，dsh 升级后启动时自动重做路由包装。**v0.1.2-alpha.2 及更新核心**：插件自动适配 `/api/remote.mux` 事件流路由，并与核心自带浏览器认证（launch-token ↔ 签名 Cookie）协作——登录插件后浏览器会被自动引导完成核心认证，随后 WebUI 正常使用。若包装不完整（dsh 内部结构变化），宿主日志输出 `ROUTE GATE INCOMPLETE`、设置页显示红色警告，且 `setup`/`configure` 拒绝启用认证（fail-closed）。
+
+> **注意（v0.1.2-alpha.2+）**：核心自带浏览器认证要求浏览器先通过 launch-token 换取核心 Cookie（`dsh web` / DSH Desktop 打印的带 `?token=` 的地址）。插件已自动处理该交换；如浏览器此前从未访问过该地址，请使用 DSH 启动时打印的完整 URL 打开一次（或从插件登录页登录，流程会自动完成交换）。
+
+## 数据与安全
+
+- 密码以 **scrypt**（Node 内置内存硬 KDF，抗 GPU/ASIC 爆破，零依赖）哈希保存在数据目录的 `dsh-webui-auth.json`，明文不落盘。凭据格式 v3（与 v2 同为 scrypt 编码，仅版本标记与字段语义不同）；0.2.x 的 v2 凭据仍可校验登录。**0.1.x 的 SHA-256 凭据自 0.2.0 起不再可校验**，需删除凭据文件后重新创建账号（见「忘记密码」）。
+- 登录失败限流：**按客户端 IP** 每分钟最多 5 次——单个攻击者无法锁死其他用户（操作者）。反代场景下客户端 IP 取自 `CF-Connecting-IP` / `X-Forwarded-For` 最左侧，且**仅当对端 socket 是回环**（本机 caddy/cloudflared）时才信任代理头，远程无法伪造；校验失败时还会空跑一次 scrypt，抹平「账号不存在=响应快」的用户名枚举时序差异。
+- 首次初始化需要每启动生成的 **setup token**（128-bit，打印到宿主日志并写入数据目录 `setup-token`，0600），防止「先暴露、后配置」被抢占。
+- 审计日志：`audit.jsonl`，客户端 IP 以 HMAC 假名化存储（见「审计日志」节）。
+- 会话持久化：`sessions.jsonl`（0600），重启恢复；写失败时认证不受影响，设置页提示重启后需重新登录。
+- 登录页与 API 响应均带安全头：严格 CSP、`nosniff`、`DENY` 防嵌框、`no-referrer`、`noindex`、`no-store`。
+- Cookie `HttpOnly + SameSite=Lax`：JS 不可读、跨站请求不携带。
+- 登录/初始化端点本身公开（认证的必然入口）：`/dsh-webui-auth/login`、`/dsh-webui-auth/setup`（后者受 setup token 保护）。
+
+## 已知边界
+
+- **桌面端不经过口令闸门（0.3.6 起）**：桌面端渲染器的请求由 shell 代理转发，而代理不保存会话 Cookie（丢弃 `set-cookie`），自定义 scheme 页面也没有可用的 Cookie jar——所以桌面端只能凭「宿主直连」进入，无法「在桌面端里登录」。这在设计上等价于「桌面端本来就持有宿主启动令牌」，与「本机进程可直接读数据目录」同属既有信任边界；口令闸门守的是浏览器（`dsh web`、局域网、反代）这条线。
+- **宿主直连豁免只认回环**：非回环客户端即使持有核心 Cookie、或知道 launch token，也仍须口令登录（文档闸门只放行 token 交换、不接受核心已认证判定）。本机反代（caddy/cloudflared）与 SSH 隧道的 socket 在宿主看来也是回环、无法与桌面端区分，但这类访问者已在本机信任边界内（可读数据目录中的会话令牌）。
+- **运行时包装的固有窗口**：路由对象被替换（服务热重载）到下一次重扫之间（≤10s）存在未保护窗口；启用认证时的 fail-closed 已挡住「初始裸奔」，此窗口仅影响运行中的热重载场景。
+- **WS 与 trustedHosts**：反代/局域网（非回环 Host）下，WS 下行需在 dsh 配置 `client-connection.trustedHosts` 中加入对外域名（见「架构」节）。
+- **反代不同机**：若反代与 DSH 不在同一台机器（对端非回环），代理头不被信任，限流将按代理 IP 聚合（退化为全局桶）。
+- **HTTPS 反代且未下发协议头**：登录后跳转的 scheme 依赖 ①`remote-web-ui.publicBaseUrl` 或 ②反代下发的 `X-Forwarded-Proto`/`Forwarded`。两者都没有时只能兜底 `http`（此时 https 端口会握手失败、页面「点了没反应」）。请二选一：在 `settings.yaml` 声明对外地址，或让反代 `proxy_set_header X-Forwarded-Proto $scheme;`。注意 `publicBaseUrl` 仅在与请求 Host 一致时生效，用来避免把局域网直连改写到公网。
+- **`--trusted-host` 不能省**：桌面浏览器用密码登录后**直连 `/api`** 的请求依赖 `--trusted-host <对外域名:端口>`；而 remote-web-ui 的配对流（`/remote` 通道）不需要它。删掉该参数会导致 `/api` 全 403。
+- **审计假名化的边界**：HMAC 密钥与审计日志同目录（0600），能读取密钥文件的本地攻击者可对 IP 空间暴力还原；假名化防的是「日志明文落盘」，不是防有文件权限的攻击者。
+- 会话存于数据目录 `sessions.jsonl`：重启后仍生效（到期时间不变）；关闭/卸载插件不影响凭据。
+- 威胁模型为「浏览器/网络客户端」：能直接读写宿主进程内存或文件的本地进程不在防护范围内。
