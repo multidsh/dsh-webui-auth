@@ -1,5 +1,5 @@
 {
-  "name": "dsh-webui-auth",
+  "name": "@multidsh/dsh-webui-auth",
   "version": "0.3.7",
   "type": "module",
   "main": "index.js",
@@ -53,5 +53,9 @@
     {
       "name": "multidsh"
     }
-  ]
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
 }

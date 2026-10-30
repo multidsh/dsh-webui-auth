@@ -71,7 +71,7 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 ### 方式一：npm 安装（推荐）
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
+npx @deepseek-ai/dsh plugin --profile web add @multidsh/dsh-webui-auth
 ```
 
 从 npm registry 拉取预构建代码（纯 JS 包，无 prepare 脚本、无需构建授权），加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。
@@ -79,22 +79,22 @@ npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
 ### 方式二：GitHub 安装
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+npx @deepseek-ai/dsh plugin --profile web add github:multidsh/dsh-webui-auth
 ```
 
 拉取仓库源码（同样直接可用，无需构建步骤）；网络不佳时优先用方式一。
 
 ### 方式三：手动（备用）
 
-1. 将 `dsh-webui-auth` 目录放入 `profiles/web/node_modules/`
+1. 将 `@multidsh/dsh-webui-auth` 目录放入 `profiles/web/node_modules/@multidsh/`
 2. 在 `profiles/web/cordis.patch.yml` 的 `insert` 列表中加一行：
 
 ```yaml
     - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+      name: '@multidsh/dsh-webui-auth'
 ```
 
-> 维护者开发模式：在本地源码目录使用 `dsh plugin --profile web add ./dsh-webui-auth`（`link:` 安装），改代码 → 重启 DSH 即生效，无需重新安装。
+> 维护者开发模式：在本地源码目录使用 `dsh plugin --profile web add ./dsh-webui-auth`（`link:` 安装，指向本仓库工作副本），改代码 → 重启 DSH 即生效，无需重新安装。
 >
 > 维护者验证：`npm test` 跑离线回归（`test/host-bridge.test.mjs` 覆盖宿主桥与闸门的全部准入分支）；`node test/desktop-host-e2e.mjs` 会拉起**真宿主**（同一 runtime、自由端口）复刻桌面端 shell 的每一条请求，验证 ① 303 + set-cookie、② `/api` RPC、③ `/plugins`（含 exact 路由）、④ WebSocket 升级、⑤ 口令闸门五组行为；加 `--preflight-desktop` 可预演真实 `desktop` profile 的组合（插件代码与数据都隔离在临时目录，不会碰到仓库里的会话文件）。`node test/desktop-live-check.mjs` 则是对**正在运行的桌面端**做只读自检（插件是否加载、闸门是否在守、`/plugins/events` 是否已被覆盖）。
 
@@ -107,7 +107,7 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 桌面端跑的是独立 profile `desktop`（`~/.dsh/profiles/desktop`），所以插件要装到**那个** profile：
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile desktop add dsh-webui-auth
+npx @deepseek-ai/dsh plugin --profile desktop add @multidsh/dsh-webui-auth
 ```
 
 也可以直接在插件管理面板里为 `desktop` profile 启用，或按「方式三」把挂载行写进 `profiles/desktop/cordis.patch.yml`。
@@ -143,7 +143,7 @@ curl.exe -s -i http://127.0.0.1:19387/ | Select-String 'HTTP/|location'
 
 ### 方式一：`dsh plugin` 命令（对应方式一安装）
 
-1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth`（同时移除依赖与组合包层）
+1. `npx @deepseek-ai/dsh plugin --profile web remove @multidsh/dsh-webui-auth`（同时移除依赖与组合包层）
 2. 重启 DSH
 
 ### 方式二：手动（对应方式二安装）
@@ -153,7 +153,7 @@ curl.exe -s -i http://127.0.0.1:19387/ | Select-String 'HTTP/|location'
 
 ```yaml
     - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+      name: '@multidsh/dsh-webui-auth'
 ```
 
    此步必须做，否则重启时加载器找不到插件包会报错

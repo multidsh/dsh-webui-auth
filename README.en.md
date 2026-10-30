@@ -75,7 +75,7 @@ This plugin is a standard **bundle**, published on npm — the official `dsh plu
 ### Method 1: npm install (recommended)
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
+npx @deepseek-ai/dsh plugin --profile web add @multidsh/dsh-webui-auth
 ```
 
 Pulls the prebuilt package from the npm registry (plain JS — no prepare script, no build authorization), adds the dependency and appends it to the `dsh.profile.bundles` list; the plugin row is inserted automatically via the bundle layer.
@@ -83,19 +83,19 @@ Pulls the prebuilt package from the npm registry (plain JS — no prepare script
 ### Method 2: GitHub install
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+npx @deepseek-ai/dsh plugin --profile web add github:multidsh/dsh-webui-auth
 ```
 
 Fetches the repository source (works directly — no build step either). Prefer Method 1 when the network to GitHub is unreliable.
 
 ### Method 3: manual (fallback)
 
-1. Put the `dsh-webui-auth` directory into `profiles/web/node_modules/`
+1. Put the `@multidsh/dsh-webui-auth` directory into `profiles/web/node_modules/@multidsh/`
 2. Add one row to the `insert` list in `profiles/web/cordis.patch.yml`:
 
 ```yaml
     - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+      name: '@multidsh/dsh-webui-auth'
 ```
 
 > Maintainer dev mode: `dsh plugin --profile web add ./dsh-webui-auth` from a local source checkout (`link:` install) — edit code, restart DSH, done; no reinstall needed.
@@ -157,7 +157,7 @@ curl.exe -s -i http://127.0.0.1:19387/ | Select-String 'HTTP/|location'
 
 ```yaml
     - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+      name: '@multidsh/dsh-webui-auth'
 ```
 
    This step is required — otherwise the loader fails at startup because the package is missing.
